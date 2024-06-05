@@ -1,0 +1,189 @@
+import config
+import telebot
+from telebot import types
+import time
+import os
+import json
+import boto3
+import openai
+from concurrent.futures import ThreadPoolExecutor
+
+logger = telebot.logger
+bot = telebot.TeleBot(config.token)
+PROXY_API_KEY = config.proxyAPIkey
+YANDEX_KEY_ID = config.YandexKeyID
+YANDEX_KEY_SECRET = config.YandexKeySecret
+YANDEX_BUCKET = config.YandexBucket
+
+# Объявление переменных
+text_start = config.start
+text_studio = config.studio
+text_freelance = config.freelance
+menu_dict = {}
+text_request_dict = {}
+
+client = openai.Client(api_key=PROXY_API_KEY, base_url="https://api.proxyapi.ru/openai/v1")
+
+def get_s3_client():
+    session = boto3.session.Session(aws_access_key_id=YANDEX_KEY_ID, aws_secret_access_key=YANDEX_KEY_SECRET)
+    return session.client(service_name="s3", endpoint_url="https://storage.yandexcloud.net")
+
+def typing(chat_id):
+    while True:
+        bot.send_chat_action(chat_id, "typing")
+        time.sleep(5)
+
+@bot.message_handler(commands=['start', 'help'])
+def handle_start(message):
+    chat_id = message.chat.id
+    menu_dict[chat_id] = 'main'
+    text_request_dict[chat_id] = "Сгенерируй описание продукта, учитывая такие данные: название продукта, ключевые слова, размерность продукта, бренд продукта, на основе этой информации: "
+    keyboard = types.ReplyKeyboardMarkup(row_width=3)
+    button1 = types.KeyboardButton('Фотостудия')
+    button2 = types.KeyboardButton('AI Заполнение')
+    button3 = types.KeyboardButton('Фриланс')
+    button4 = types.KeyboardButton('Генерация изображения')
+    button5 = types.KeyboardButton('Вернуться в главное меню')
+    keyboard.add(button1, button2, button3, button4, button5)
+
+    # Отправка сообщения с клавиатурой
+    bot.reply_to(message, text_start, reply_markup=keyboard)
+
+def handle_AI(message):
+    keyboard = types.ReplyKeyboardMarkup(row_width=3)
+    button1 = types.KeyboardButton('Ввести запрос целиком')
+    button2 = types.KeyboardButton('Ввести запрос по шаблону')
+    button3 = types.KeyboardButton('Вернуться в главное меню')
+    keyboard.add(button1, button2, button3)
+
+    bot.reply_to(message, "Выберите, как будете вводить запрос на генерацию карточки", reply_markup=keyboard)
+
+@bot.message_handler(func=lambda message: True, content_types=["text"])
+def handle_message(message):
+    executor.submit(process_message, message)
+
+def process_message(message):
+    chat_id = message.chat.id
+    if chat_id not in menu_dict:
+        menu_dict[chat_id] = "main"
+    menu = menu_dict[chat_id]
+
+    text_request = ""
+
+    if menu == "main":
+        if message.text == 'Фотостудия':
+            bot.reply_to(message, text_studio)
+        elif message.text == 'AI Заполнение':
+            menu_dict[chat_id] = "AI_start_page"
+            handle_AI(message)
+        elif message.text == 'Фриланс':
+            bot.reply_to(message, text_freelance)
+        elif message.text == 'Генерация изображения':
+            bot.reply_to(message, "Сервера OpenAI перегружены, генерация изображений временно невозможна.")
+            handle_start(message)
+        elif message.text == "Вернуться в главное меню":
+            handle_start(message)
+        else:
+            handle_start(message)
+    elif menu == "AI_start_page":
+        if message.text == 'Ввести запрос целиком':
+            menu_dict[chat_id] = "full request"
+            bot.reply_to(message, "Введите запрос:", reply_markup=types.ReplyKeyboardRemove())
+        elif message.text == 'Ввести запрос по шаблону':
+            menu_dict[chat_id] = "template request"
+            bot.reply_to(message, "Введите название товара:", reply_markup=types.ReplyKeyboardRemove())
+        elif message.text == "Вернуться в главное меню":
+            menu_dict[chat_id] = "main"
+            handle_start(message)
+    elif menu == "full request":
+        menu_dict[chat_id] = 'main'
+        text_request_dict[chat_id] = "Сгенерируй описание продукта, учитывая такие данные: название продукта, ключевые слова, размерность продукта, бренд продукта, на основе этой информации: "
+        text_request_dict[chat_id] += message.text
+        echo_message(message, text_request)
+    elif menu == "template request":
+        bot.reply_to(message, "Введите ключевые слова")
+        menu_dict[chat_id] = 'key words'
+        text_request_dict[chat_id] = "Сгенерируй описание продукта, учитывая такие данные: название продукта, ключевые слова, размерность продукта, бренд продукта, на основе этой информации: "
+        text_request_dict[chat_id] += message.text + ', : '
+    elif menu == "key words":
+        bot.reply_to(message, "Введите размерность товара")
+        menu_dict[chat_id] = "Size"
+        text_request_dict[chat_id] += message.text + ', '
+    elif menu == "Size":
+        bot.reply_to(message, "Введите имя Бренда")
+        menu_dict[chat_id] = "Brand"
+        text_request_dict[chat_id] += message.text + ", "
+    elif menu == "Brand":
+        menu_dict[chat_id] = "main"
+        text_request_dict[chat_id]+= message.text
+        echo_message(message, text_request_dict[chat_id])
+        handle_start(message)
+
+def echo_message(message, text):
+    chat_id = message.chat.id
+    bot.reply_to(message, "Подождите немного, скоро будет сформирован ответ")
+    bot.reply_to(message, text)
+    ai_response_future = executor.submit(process_text_message, text, chat_id)
+
+    ai_response = ai_response_future.result()
+    bot.reply_to(message, ai_response)
+
+def process_text_message(text, chat_id) -> str:
+    model = "gpt-3.5-turbo"
+
+    # read current chat history
+    s3client = get_s3_client()
+    history = []
+    try:
+        history_object_response = s3client.get_object(
+            Bucket=YANDEX_BUCKET, Key=f"{chat_id}.json"
+        )
+        history = json.loads(history_object_response["Body"].read())
+    except:
+        pass
+
+    history.append({"role": "user", "content": text})
+
+    try:
+        chat_completion = client.chat.completions.create(
+            model=model, messages=history
+        )
+    except Exception as e:
+        if type(e).__name__ == "BadRequestError":
+            clear_history_for_chat(chat_id)
+            return process_text_message(text, chat_id)
+        else:
+            raise e
+    ai_response = chat_completion.choices[0].message.content
+    history.append({"role": "assistant", "content": ai_response})
+
+    # save current chat history
+    s3client.put_object(
+        Bucket=YANDEX_BUCKET,
+        Key=f"{chat_id}.json",
+        Body=json.dumps(history),
+    )
+
+    return ai_response
+
+def clear_history_for_chat(chat_id):
+    try:
+        s3client = get_s3_client()
+        s3client.put_object(
+            Bucket=YANDEX_BUCKET,
+            Key=f"{chat_id}.json",
+            Body=json.dumps([]),
+        )
+    except:
+        pass
+
+def handler(event, context):
+    message = json.loads(event["body"])
+    update = telebot.types.Update.de_json(message)
+
+    if update.message is not None:
+        bot.process_new_updates([update])
+
+if __name__ == '__main__':
+    with ThreadPoolExecutor() as executor:
+        bot.infinity_polling()
